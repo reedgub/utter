@@ -12,6 +12,13 @@ public enum InsertMethod: String, CaseIterable, Sendable {
     case paste, type
 }
 
+/// How the local model is run. `server` keeps whisper-server running with the
+/// model loaded, so each dictation skips loading it; `cli` starts whisper-cli
+/// per dictation and uses no memory in between.
+public enum LocalEngine: String, CaseIterable, Sendable {
+    case server, cli
+}
+
 /// Everything that lives in ~/.config/utter/config.toml. Defaults here must match
 /// `Config.template`; a test enforces that.
 public struct Config: Equatable, Sendable {
@@ -24,6 +31,8 @@ public struct Config: Equatable, Sendable {
     public var localModel = "small.en"
     public var whisperCLI = ""
     public var whisperThreads = 0
+    public var localEngine: LocalEngine = .server
+    public var beamSize = 1
     public var language = "en"
     public var vocabulary = ""
     public var groqTranscribeModel = "whisper-large-v3-turbo"
@@ -223,6 +232,8 @@ public enum ConfigParser {
             case "local_model": if let v = string(e) { c.localModel = v }
             case "whisper_cli": if let v = string(e) { c.whisperCLI = v }
             case "whisper_threads": if let v = int(e, 0...64) { c.whisperThreads = v }
+            case "local_engine": if let v = choice(e, LocalEngine.self) { c.localEngine = v }
+            case "beam_size": if let v = int(e, 1...8) { c.beamSize = v }
             case "language": if let v = string(e) { c.language = v.isEmpty ? "auto" : v }
             case "vocabulary": if let v = string(e) { c.vocabulary = v }
             case "groq_transcribe_model": if let v = string(e) { c.groqTranscribeModel = v }
@@ -280,6 +291,13 @@ extension Config {
     # Path to whisper-cli. Empty searches /opt/homebrew/bin and /usr/local/bin.
     whisper_cli = ""
     whisper_threads = 0   # 0 lets whisper.cpp decide
+    # "server" keeps the model loaded in a background whisper-server process, so
+    # dictation does not wait for the model to load each time (fast; uses memory:
+    # about 0.5 GB for small, 1.5 GB for medium). "cli" loads it per dictation.
+    local_engine = "server"
+    # 1 decodes in a single greedy pass (fastest). Up to 8 tries several candidate
+    # transcripts (beam search): slightly more accurate, noticeably slower.
+    beam_size = 1
     # Spoken language ("en", "de", "fr", ...) or "auto". English-only *.en models need "en".
     language = "en"
     # Names and jargon to spell correctly, comma separated. Passed to Whisper as a
@@ -318,4 +336,65 @@ extension Config {
     # as silence and skipped instead of being sent to Whisper.
     silence_threshold = 0.01
     """#
+}
+
+/// Changes one setting in the text of config.toml, keeping every other line,
+/// comment and the setting's own trailing comment as they were. Used by the
+/// settings window so the hand-edited file stays readable.
+public enum ConfigEditor {
+    public static func encode(_ value: ConfigValue) -> String {
+        switch value {
+        case .bool(let b): return b ? "true" : "false"
+        case .int(let i): return String(i)
+        case .double(let d): return String(d)
+        case .string(let s):
+            let escaped = s
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+                .replacingOccurrences(of: "\n", with: "\\n")
+                .replacingOccurrences(of: "\t", with: "\\t")
+            return "\"\(escaped)\""
+        }
+    }
+
+    public static func set(_ key: String, to value: ConfigValue, in text: String) -> String {
+        var lines = text.components(separatedBy: "\n")
+        for (i, line) in lines.enumerated() {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.hasPrefix("#"), let eq = trimmed.firstIndex(of: "=") else { continue }
+            guard trimmed[..<eq].trimmingCharacters(in: .whitespaces) == key else { continue }
+            let indent = String(line.prefix(while: { $0 == " " || $0 == "\t" }))
+            let comment = trailingComment(afterEquals: String(trimmed[trimmed.index(after: eq)...]))
+            lines[i] = "\(indent)\(key) = \(encode(value))\(comment)"
+            return lines.joined(separator: "\n")
+        }
+        var out = text
+        if !out.isEmpty && !out.hasSuffix("\n") { out += "\n" }
+        return out + "\(key) = \(encode(value))\n"
+    }
+
+    /// The `   # comment` part after a value, with the spacing before it.
+    static func trailingComment(afterEquals rest: String) -> String {
+        let chars = Array(rest)
+        var i = 0
+        while i < chars.count && (chars[i] == " " || chars[i] == "\t") { i += 1 }
+        var hash: Int?
+        if i < chars.count, chars[i] == "\"" || chars[i] == "'" {
+            let quote = chars[i]
+            i += 1
+            while i < chars.count {
+                if quote == "\"" && chars[i] == "\\" { i += 2; continue }
+                if chars[i] == quote { i += 1; break }
+                i += 1
+            }
+            hash = chars[min(i, chars.count)...].firstIndex(of: "#")
+        } else {
+            hash = chars[i...].firstIndex(of: "#")
+        }
+        guard let h = hash else { return "" }
+        var start = h
+        while start > 0 && (chars[start - 1] == " " || chars[start - 1] == "\t") { start -= 1 }
+        let spacing = start == h ? " " : String(chars[start..<h])
+        return spacing + String(chars[h...])
+    }
 }

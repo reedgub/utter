@@ -15,7 +15,10 @@ cursor in whatever app you are in, transcribed by Whisper and cleaned up by an L
 - **Inserts at the cursor** using pasteboard + ⌘V (or simulated typing). The transcript stays
   on the clipboard so you can paste it again, unless you ask for your old clipboard back.
 - **A small floating pill** shows that it is listening, in which mode, with a level meter.
-- **Menu bar icon** with on/off, launch at login, permission status and settings.
+- **An app window** for settings, API keys, permissions and on/off. Close it and Utter keeps
+  running in the menu bar; open Utter again (or use the menu bar icon) to bring it back.
+- **Fast local transcription**: the model stays loaded in a background whisper-server, so a
+  dictation does not wait for it to load.
 - No accounts, no telemetry, no analytics. With the local model and `cleanup = "off"` or
   `"ollama"`, nothing leaves your Mac.
 
@@ -43,8 +46,10 @@ make model MODEL=medium.en        # ~1.5 GB
 and set `local_model = "medium.en"` in the settings file. Use `small` / `medium`
 (without `.en`) for languages other than English.
 
-On first launch Utter writes `~/.config/utter/config.toml` and `~/.config/utter/.env`
-and asks for the permissions below.
+On first launch Utter opens its window, writes `~/.config/utter/config.toml` and
+`~/.config/utter/.env`, and asks for the permissions below.
+
+To update later: `git pull && make install`.
 
 ## Permissions
 
@@ -119,9 +124,36 @@ skipped rather than sent to Whisper (Whisper tends to "hear" *Thank you.* in sil
 The pill sits at the bottom of the screen your pointer is on. It never takes focus or
 clicks, so the app you are dictating into stays active.
 
+## The window
+
+Opening Utter shows a window with an on/off switch, your hotkey, the transcription and
+cleanup choices, API key fields, permission status, and how long the last dictation took.
+Changes save immediately. Closing the window does not quit Utter: it keeps running in the
+menu bar, ready for the hotkey. To get the window back, open Utter again from Finder,
+Spotlight or Launchpad, or choose **Open Utter…** from the menu bar icon. **Quit Utter** is
+in the window, the menu bar menu, and ⌘Q.
+
+## Speed
+
+Each dictation shows its timing in the window and the menu, for example
+`6.2 s of audio · whisper (loaded) 0.7 s · cleanup 0.5 s`, so you can see which step is slow.
+
+- **Keep the model loaded** (`local_engine = "server"`, the default). Utter runs
+  `whisper-server` in the background with the model in memory and warms it up at launch.
+  Without it (`"cli"`), every dictation loads the model and sets up the GPU again first. The
+  cost is memory: about 0.5 GB for small, 1.5 GB for medium.
+- **Fast decoding** (`beam_size = 1`, the default) makes one pass instead of trying 5
+  candidates. "Thorough" in the window (`beam_size = 5`) is slightly more accurate and slower.
+- **Model size**: `small.en` is several times faster than `medium.en`. On an Intel Mac,
+  stay on small or use Groq.
+- **Groq** (`transcriber = "groq"`) is usually the fastest option of all, if you are online.
+- **Cleanup** adds one LLM round trip. Groq is the quickest; set `cleanup = "off"` to skip it.
+
+whisper-server's output goes to `~/.config/utter/whisper-server.log`.
+
 ## Settings
 
-Everything lives in `~/.config/utter/config.toml`. Open it from the menu bar icon
+Everything can be changed in the window. It all lives in `~/.config/utter/config.toml`. Open it from the menu bar icon
 (**Open Settings File**) and choose **Reload Settings** after editing. Problems in the
 file are listed at the top of the menu; the app keeps the default for any value it
 cannot read. The generated file documents every option. The main ones:
@@ -200,7 +232,9 @@ Your words are never lost to a cleanup failure.
   Keyboard Entry*) has focus. This is by design.
 - **The text is transcribed but not inserted.** Accessibility is missing, or the target app
   blocks synthetic paste. Try `insert_method = "type"`.
-- **"whisper-cli not found".** `brew install whisper-cpp`, or set `whisper_cli` to its path.
+- **"whisper-cli not found" / "whisper-server not found".** `brew install whisper-cpp`
+  (it provides both), or set `whisper_cli` to its path.
+- **Transcription is slow.** Check the timing line in the window, then see *Speed*.
 - **"No model at …".** `make model` (or `make model MODEL=medium.en`).
 - **Launch at Login fails.** It only works for an app in `/Applications`; use `make install`.
 
@@ -224,8 +258,12 @@ The code is split so the logic that matters can be tested without a Mac's UI:
     whisper-cli arguments, transcript filtering, the cleanup guard, WAV encoding.
 - `Sources/Utter` (AppKit app)
   - `EventTap.swift`: the CGEvent tap. `AudioRecorder.swift`: AVAudioEngine → 16 kHz mono.
-  - `Pipeline.swift`: transcribe → clean up, cancellable. `Inserter.swift`: paste or type.
-  - `Pill.swift`, `MenuBar.swift`, `Permissions.swift`, `AppController.swift`.
+  - `Pipeline.swift`: transcribe → clean up, cancellable, timed. `Inserter.swift`: paste or type.
+  - `WhisperServer.swift`: the resident whisper-server process (start, health check, warm-up,
+    restart on settings change, cleanup of a leftover process).
+  - `MainWindow.swift`: the SwiftUI window. `Pill.swift`, `MenuBar.swift`, `Permissions.swift`,
+    `AppController.swift`.
+- `scripts/make-icon.py` draws the app icon.
 
 ## License
 

@@ -139,7 +139,7 @@ final class RequestTests: XCTestCase {
         config.vocabulary = "Utter"
         let args = LocalWhisper.arguments(model: "/m.bin", audio: "/a.wav", config: config)
         XCTAssertEqual(args, ["-m", "/m.bin", "-f", "/a.wav", "--no-timestamps", "--no-prints",
-                              "-l", "en", "-t", "4", "--prompt", "Utter"])
+                              "-l", "en", "-bs", "1", "-t", "4", "--prompt", "Utter"])
         XCTAssertEqual(LocalWhisper.modelURL(for: "small.en", modelsDir: URL(fileURLWithPath: "/models")).path,
                        "/models/ggml-small.en.bin")
         XCTAssertEqual(LocalWhisper.modelURL(for: "/opt/x.bin").path, "/opt/x.bin")

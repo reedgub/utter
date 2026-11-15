@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import ServiceManagement
 import UtterCore
 
 /// Runs `body` on the main actor after the current event, preserving order.
@@ -20,9 +21,20 @@ final class AppController: NSObject, NSApplicationDelegate {
     private let pill = PillController()
     private var menu: MenuBarController!
 
+    private let server = WhisperServer()
+    let model = AppModel()
+    private var window: MainWindowController!
+    private var windowRefreshTimer: Timer?
+    private(set) var lastRun: String?
+
     private var pipeline: Task<Void, Never>?
     private var pipelineID = 0
     private var permissionTimer: Timer?
+
+    private var openWindowOnLaunch: Bool {
+        get { UserDefaults.standard.object(forKey: "openWindowOnLaunch") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "openWindowOnLaunch") }
+    }
 
     var isEnabled: Bool = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true {
         didSet {
@@ -32,6 +44,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                 send(.reset)
             }
             refreshIcon()
+            refreshModel()
         }
     }
 
@@ -39,7 +52,11 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         writeTemplatesIfMissing()
+        installMainMenu()
         menu = MenuBarController(app: self)
+        window = MainWindowController(model: model, actions: self)
+        window.onVisibilityChange = { [weak self] visible in self?.windowVisibilityChanged(visible) }
+        server.onStateChange = { [weak self] in self?.refreshModel() }
         reloadSettings(announce: false)
 
         recorder.onLevel = { [weak self] rms in
@@ -54,11 +71,73 @@ final class AppController: NSObject, NSApplicationDelegate {
         if !tap.isRunning { Permission.inputMonitoring.request() }
         if permissionsIncomplete { waitForPermissions() }
         refreshIcon()
+        refreshModel()
+        if openWindowOnLaunch || permissionsIncomplete { showWindow() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         recorder.cancel()
         pipeline?.cancel()
+        server.stop()
+    }
+
+    /// Opening Utter again (Finder, Spotlight, Launchpad, Dock) while it runs.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showWindow()
+        return true
+    }
+
+    func showWindow() {
+        refreshModel()
+        window.show()
+    }
+
+    /// While the window is open, keep its permission list live: permissions are
+    /// granted in System Settings, which tells us nothing.
+    private func windowVisibilityChanged(_ visible: Bool) {
+        windowRefreshTimer?.invalidate()
+        windowRefreshTimer = nil
+        guard visible else { return }
+        windowRefreshTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refreshModel() }
+        }
+    }
+
+    /// A normal app menu, so ⌘Q, ⌘W and ⌘V/⌘C work while the window is open.
+    private func installMainMenu() {
+        let main = NSMenu()
+
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "About Utter", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Hide Utter", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit Utter", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let appItem = NSMenuItem()
+        appItem.submenu = appMenu
+        main.addItem(appItem)
+
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let editItem = NSMenuItem()
+        editItem.submenu = edit
+        main.addItem(editItem)
+
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        let windowItem = NSMenuItem()
+        windowItem.submenu = windowMenu
+        main.addItem(windowItem)
+
+        NSApp.mainMenu = main
+        NSApp.windowsMenu = windowMenu
     }
 
     /// Without Accessibility the tap cannot start (or is listen-only) and Cmd-V
@@ -83,6 +162,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                 timer.invalidate()
                 self.permissionTimer = nil
                 self.refreshIcon()
+                self.refreshModel()
                 self.pill.flash("Ready · hold \(self.detector.hotkey.displayName) to dictate")
             }
         }
@@ -131,6 +211,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         pill.configure(hotkeyName: detector.hotkey.displayName, maxDuration: config.timing.maxDuration)
         settingsWarnings = warnings
         for w in warnings { log.warning("settings: \(w, privacy: .public)") }
+        updateServer()
+        refreshModel()
 
         if announce {
             if warnings.isEmpty {
@@ -140,6 +222,67 @@ final class AppController: NSObject, NSApplicationDelegate {
             }
         }
         refreshIcon()
+    }
+
+    // MARK: Local model server
+
+    private var usesLocalServer: Bool {
+        guard config.localEngine == .server else { return false }
+        if case .success(.local) = Backends.transcriber(for: config, keys: keys) { return true }
+        return false
+    }
+
+    /// Starts, restarts or stops whisper-server to match the settings.
+    private func updateServer() {
+        guard usesLocalServer else {
+            server.stop()
+            return
+        }
+        if let spec = WhisperServerAPI.spec(for: config) {
+            server.ensureRunning(spec)
+        } else {
+            server.stop()
+        }
+    }
+
+    var engineStatus: String {
+        guard case .success(.local) = Backends.transcriber(for: config, keys: keys) else {
+            return "not used (cloud transcription)"
+        }
+        let modelURL = LocalWhisper.modelURL(for: config.localModel)
+        if !FileManager.default.fileExists(atPath: modelURL.path) {
+            return "\(config.localModel) not downloaded · run make model MODEL=\(config.localModel)"
+        }
+        if config.localEngine == .cli {
+            return LocalWhisper.findExecutable(configured: config.whisperCLI) == nil
+                ? "whisper-cli not found · brew install whisper-cpp"
+                : "\(config.localModel) · loads per dictation"
+        }
+        if WhisperServerAPI.findExecutable(configuredCLI: config.whisperCLI) == nil {
+            return "whisper-server not found · brew install whisper-cpp"
+        }
+        return "\(config.localModel) · \(server.summary)"
+    }
+
+    /// Pushes current state into the window's model.
+    private func refreshModel() {
+        model.status = statusLine
+        model.isEnabled = isEnabled
+        model.config = config
+        model.warnings = settingsWarnings
+        var permissions: [Permission: Bool] = [:]
+        for p in Permission.allCases { permissions[p] = p.isGranted }
+        model.permissions = permissions
+        model.keysSaved = [
+            "GROQ_API_KEY": keys.groq != nil,
+            "OPENAI_API_KEY": keys.openai != nil,
+            "ANTHROPIC_API_KEY": keys.anthropic != nil,
+        ]
+        model.installedModels = LocalWhisper.installedModels()
+        model.engineStatus = engineStatus
+        model.lastRun = lastRun
+        model.launchAtLogin = SMAppService.mainApp.status == .enabled
+        model.openWindowOnLaunch = openWindowOnLaunch
     }
 
     // MARK: Menu state
@@ -293,7 +436,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         let id = pipelineID
         pill.show(.working(autoStopped ? "Time limit reached · transcribing" : "Transcribing"))
 
-        let job = Pipeline(config: config, keys: keys) { stage in
+        let job = Pipeline(config: config, keys: keys, server: config.localEngine == .server ? server : nil) { stage in
             onMain { [weak self] in
                 guard let self, self.pipelineID == id else { return }
                 self.pill.show(.working(stage))
@@ -317,8 +460,10 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     private func pipelineFinished(_ outcome: Result<PipelineOutcome, Error>, insertMethod: InsertMethod, restoreClipboard: Bool) {
         switch outcome {
-        case .success(.text(let text, let note)):
+        case .success(.text(let text, let note, let timings)):
             Inserter.insert(text, method: insertMethod, restoreClipboard: restoreClipboard)
+            lastRun = timings.summary
+            log.info("dictation: \(timings.summary, privacy: .public)")
             if let note { pill.flash(note, isError: true, seconds: 2.5) } else { pill.show(.hidden) }
         case .success(.noSpeech):
             pill.flash("No speech detected")
@@ -331,5 +476,78 @@ final class AppController: NSObject, NSApplicationDelegate {
             }
         }
         send(.processingFinished)
+        refreshModel()
+    }
+}
+
+// MARK: - Window actions
+
+extension AppController: AppActions {
+    func setEnabled(_ on: Bool) {
+        isEnabled = on
+    }
+
+    func setSetting(_ key: String, _ value: ConfigValue) {
+        let text = (try? String(contentsOf: Paths.configFile, encoding: .utf8)) ?? Config.template
+        let updated = ConfigEditor.set(key, to: value, in: text)
+        do {
+            try updated.write(to: Paths.configFile, atomically: true, encoding: .utf8)
+        } catch {
+            pill.flash("Could not save settings: \(error.localizedDescription)", isError: true, seconds: 3)
+            return
+        }
+        reloadSettings(announce: false)
+    }
+
+    func setAPIKey(_ name: String, _ value: String?) {
+        let text = (try? String(contentsOf: Paths.envFile, encoding: .utf8)) ?? APIKeys.template
+        let updated = DotEnv.set(name, to: value, in: text)
+        do {
+            // Written whole and then locked back down: an atomic write makes a new
+            // file, which would otherwise be readable by other users.
+            try updated.write(to: Paths.envFile, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Paths.envFile.path)
+        } catch {
+            pill.flash("Could not save key: \(error.localizedDescription)", isError: true, seconds: 3)
+            return
+        }
+        reloadSettings(announce: false)
+    }
+
+    func setLaunchAtLogin(_ on: Bool) {
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Could not change Launch at Login"
+            alert.informativeText = "\(error.localizedDescription)\n\nMove Utter.app to /Applications (make install) and try again."
+            alert.runModal()
+        }
+        refreshModel()
+    }
+
+    func setOpenWindowOnLaunch(_ on: Bool) {
+        openWindowOnLaunch = on
+        refreshModel()
+    }
+
+    func openPermission(_ permission: Permission) {
+        permission.request()
+        permission.openSettings()
+    }
+
+    func openSettingsFile() {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-t", Paths.configFile.path]
+        try? process.run()
+    }
+
+    func openModelsFolder() {
+        NSWorkspace.shared.open(Paths.modelsDir)
+    }
+
+    func quit() {
+        NSApp.terminate(nil)
     }
 }

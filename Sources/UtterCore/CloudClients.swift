@@ -169,6 +169,21 @@ public enum CleanupClient {
     }
 }
 
+extension WhisperServerAPI {
+    public static func transcribe(baseURL: URL, wav: Data, vocabulary: String,
+                                  session: URLSession = .shared) async throws -> String {
+        let data = try await HTTP.send(inferenceRequest(baseURL: baseURL, wav: wav, vocabulary: vocabulary), session: session)
+        return try CloudWhisper.parse(data)
+    }
+
+    public static func isHealthy(_ baseURL: URL, session: URLSession = .shared) async -> Bool {
+        var req = URLRequest(url: healthURL(baseURL))
+        req.timeoutInterval = 2
+        guard let (_, response) = try? await session.data(for: req) else { return false }
+        return (response as? HTTPURLResponse)?.statusCode == 200
+    }
+}
+
 enum HTTP {
     static func send(_ request: URLRequest, session: URLSession) async throws -> Data {
         let (data, response) = try await session.data(for: request)

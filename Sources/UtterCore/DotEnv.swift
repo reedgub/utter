@@ -65,3 +65,41 @@ public struct APIKeys: Equatable, Sendable {
     # ANTHROPIC_API_KEY=sk-ant-...
     """
 }
+
+extension DotEnv {
+    /// Sets or removes one key in .env text. Reuses the existing line for the key,
+    /// or the commented-out template line (`# KEY=...`), so the file keeps its shape.
+    /// A nil or empty value comments the key out.
+    public static func set(_ key: String, to value: String?, in text: String) -> String {
+        var lines = text.components(separatedBy: "\n")
+
+        func keyOf(_ line: String) -> (key: String, commented: Bool)? {
+            var l = line.trimmingCharacters(in: .whitespaces)
+            var commented = false
+            if l.hasPrefix("#") {
+                commented = true
+                l = l.dropFirst().trimmingCharacters(in: .whitespaces)
+            }
+            if l.hasPrefix("export ") { l = String(l.dropFirst("export ".count)) }
+            guard let eq = l.firstIndex(of: "=") else { return nil }
+            return (l[..<eq].trimmingCharacters(in: .whitespaces), commented)
+        }
+
+        let trimmedValue = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let needsQuotes = trimmedValue.contains { $0 == " " || $0 == "#" || $0 == "'" || $0 == "\"" }
+        let newLine = trimmedValue.isEmpty
+            ? "# \(key)="
+            : "\(key)=\(needsQuotes ? "\"\(trimmedValue.replacingOccurrences(of: "\"", with: ""))\"" : trimmedValue)"
+
+        let active = lines.firstIndex { keyOf($0).map { $0.key == key && !$0.commented } ?? false }
+        let template = lines.firstIndex { keyOf($0).map { $0.key == key && $0.commented } ?? false }
+        if let index = active ?? (trimmedValue.isEmpty ? nil : template) {
+            lines[index] = newLine
+            return lines.joined(separator: "\n")
+        }
+        if trimmedValue.isEmpty { return text }
+        var out = text
+        if !out.isEmpty && !out.hasSuffix("\n") { out += "\n" }
+        return out + newLine + "\n"
+    }
+}

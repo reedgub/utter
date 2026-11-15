@@ -42,7 +42,13 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
+        let open = action("Open Utter…", #selector(openWindow))
+        open.keyEquivalent = ","
+        menu.addItem(open)
+        menu.addItem(.separator())
+
         menu.addItem(disabled(app.statusLine))
+        if let lastRun = app.lastRun { menu.addItem(disabled("Last: \(lastRun)")) }
         for warning in app.settingsWarnings.prefix(4) {
             menu.addItem(disabled("⚠︎ " + warning))
         }
@@ -54,6 +60,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         menu.addItem(.separator())
 
         menu.addItem(disabled("Transcription: \(app.transcriptionSummary)"))
+        menu.addItem(disabled("Local engine: \(app.engineStatus)"))
         menu.addItem(disabled("Cleanup: \(app.cleanupSummary)"))
         menu.addItem(.separator())
 
@@ -99,6 +106,7 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     @objc private func toggleEnabled() { app.isEnabled.toggle() }
+    @objc private func openWindow() { app.showWindow() }
 
     @objc private func openPermission(_ sender: NSMenuItem) {
         guard let title = sender.representedObject as? String,
