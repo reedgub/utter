@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test core
+        run: swift test
+      - name: Build app bundle
+        run: scripts/build-app.sh
+      - name: Check bundle
+        run: |
+          codesign --verify --verbose build/Utter.app
+          plutil -lint build/Utter.app/Contents/Info.plist
